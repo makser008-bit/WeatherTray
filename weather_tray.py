@@ -10,7 +10,7 @@ from ctypes import wintypes as wt
 import winreg
 
 APP = "WeatherTray"
-VERSION = "0.4.2"
+VERSION = "0.4.4"
 
 def app_dir():
     base = sys.executable if getattr(sys, "frozen", False) else os.path.abspath(__file__)
@@ -1243,17 +1243,94 @@ _tip_proc_ref = WNDPROC(tip_proc)
 
 wx = Widget()
 
+# ---------------- сусідні віджети (інші наші програми на цій же панелі) ----------------
+PEER_GAP_DP = 4                                   # проміжок між віджетами різних програм (dp), як усередині X11 Battery
+MY_CLASS = "WeatherTrayWidget"
+PEER_CLASSES = ("LoadTrayWidget", "X11BatteryWidget",)
+applied = {"px": None}                            # останній прийнятий відступ від трея (px)
+peer_state = {"yield": False}                     # після скидання позиції поступаємося сусіду при рівних відступах
+
+def peer_spans(tb, rtb):
+    """Прямокутники віджетів інших програм на цій панелі: (ліво, право, клас) в координатах панелі."""
+    out = []
+    try:
+        for cls in PEER_CLASSES:
+            prev = None
+            for _ in range(8):
+                h = user32.FindWindowExW(tb, prev, cls, None)
+                if not h:
+                    break
+                prev = h
+                if not user32.IsWindowVisible(h):
+                    continue
+                rc = wt.RECT()
+                if user32.GetWindowRect(h, ctypes.byref(rc)) and (rc.right - rc.left) > 12:
+                    out.append((rc.left - rtb.left, rc.right - rtb.left, cls))
+    except Exception:
+        log_exc()
+    return out
+
+def nearest_free(off_px, max_px, zones):
+    """Найближчий до off_px допустимий відступ поза забороненими зонами (None, якщо місця немає)."""
+    def free(o):
+        return 0 <= o <= max_px and not any(z[0] + 2 < o < z[1] - 2 for z in zones)
+    cands = [off_px] + [z[0] for z in zones] + [z[1] for z in zones] + [0, max_px]
+    cands = [c for c in cands if free(c)]
+    return min(cands, key=lambda c: abs(c - off_px)) if cands else None
+
+def avoid_peers(off_px, cur_px, max_px, width, tray_x, gap, peers, dragging, yield_all=False):
+    """Повертає відступ від трея (px), при якому блок шириною width не торкається сусідніх віджетів
+    і між ними лишається проміжок gap. Під час перетягування віджет можна поставити перед сусідом
+    або за ним (коли перетягнули за середину сусіда - він перестрибує на інший бік), але ніколи не
+    поверх нього. Поза перетягуванням той, хто стоїть далі від трея, відсувається ліворуч."""
+    forb = []  # (lo, hi, відступ сусіда від трея, клас): заборонена зона для off
+    for a, b, cls in peers:
+        forb.append((tray_x - b - gap - width, tray_x - a + gap, tray_x - b, cls))
+    if dragging:
+        r = nearest_free(off_px, max_px, forb)
+        return cur_px if (r is None and cur_px is not None) else (off_px if r is None else r)
+    if yield_all:
+        mine = forb
+    else:
+        mine = [f for f in forb if f[2] < off_px or (f[2] == off_px and f[3] < MY_CLASS)]
+    for _ in range(len(mine) + 1):
+        hit = [f for f in mine if f[0] + 2 < off_px < f[1] - 2]
+        if not hit:
+            break
+        off_px = max(f[1] for f in hit)
+    if off_px > max_px or any(f[0] + 2 < off_px < f[1] - 2 for f in mine):
+        r = nearest_free(min(off_px, max_px), max_px, mine)  # зліва немає місця - шукаємо з іншого боку
+        if r is not None:
+            off_px = r
+    return off_px
+
+def peer_tick(w):
+    """Раз на секунду перевіряємо, чи не накрив нас інший віджет (наприклад, після перемикання монітора)."""
+    try:
+        if w.alive() and not drag["active"]:
+            layout()
+    except Exception:
+        log_exc()
+
 def place(w, x, h):
     user32.SetWindowPos(w.hwnd, None, x, 0, w.size[0], h, 0x10 | 0x40)  # NOACTIVATE | SHOWWINDOW
 
 def clamp_offset(info):
-    """Не даємо віджету заїхати за край панелі (ліворуч) або за трей (праворуч)."""
+    """Не даємо віджету заїхати за край панелі (ліворуч), за трей (праворуч) або на віджети інших програм."""
     global offset_dp
     tb, rtb, rtray = info
     sc = get_scale()
-    max_px = max(0, (rtray.left - rtb.left) - wx.size[0])
-    off_px = min(max(0, int(offset_dp * sc)), max_px)
-    offset_dp = int(off_px / sc)
+    width = wx.size[0]
+    max_px = max(0, (rtray.left - rtb.left) - width)
+    want = min(max(0, int(offset_dp * sc)), max_px)
+    dragging = bool(drag["active"] and drag["moved"])
+    off_px = avoid_peers(want, applied["px"], max_px, width, rtray.left - rtb.left, int(PEER_GAP_DP * sc),
+                         peer_spans(tb, rtb), dragging, peer_state["yield"])
+    off_px = min(max(0, off_px), max_px)
+    offset_dp = int(math.ceil(off_px / sc))
+    applied["px"] = off_px
+    if off_px != want and not dragging:  # зсунулись, щоб не накладатись - запам'ятовуємо нове місце
+        reg_set(offset_key(active_dev), offset_dp)
 
 def layout(info=None):
     """Віджет стоїть ліворуч від трея на відстані offset_dp."""
@@ -1276,6 +1353,7 @@ def widgets_update(force=False):
         tb, rtb, rtray = info
         h = rtb.bottom - rtb.top
         if not wx.alive() or wx.parent != tb:
+            peer_state["yield"] = True
             wx.destroy()
             if not wx.create(tb):
                 return
@@ -1283,6 +1361,7 @@ def widgets_update(force=False):
             wx.key = None
         wx.render(h)
         layout(info)
+        peer_state["yield"] = False
         if wx.hwnd and wx.pending is not None:
             apply_bitmap(wx.hwnd, wx.size[0], wx.size[1], wx.pending)
             wx.pending = None
@@ -1307,7 +1386,11 @@ def reset_position():
     global offset_dp
     offset_dp = 8
     reg_set(offset_key(active_dev), offset_dp)
-    layout()
+    peer_state["yield"] = True   # якщо там уже стоїть сусід - відсуваємось від нього
+    try:
+        layout()
+    finally:
+        peer_state["yield"] = False
 
 def select_language(i):
     """i = 0 - автоматично (мова Windows), далі - мови зі списку меню."""
@@ -1746,6 +1829,7 @@ def widget_proc(hwnd, msg, wparam, lparam):
         hide_tip()
         pt = wt.POINT(); user32.GetCursorPos(ctypes.byref(pt))
         drag.update(active=True, x0=pt.x, off0=offset_dp, moved=False)
+        applied["px"] = int(offset_dp * get_scale())
         user32.SetCapture(hwnd)
         return 0
     if msg == 0x200 and drag["active"]:  # WM_MOUSEMOVE
@@ -1787,6 +1871,9 @@ def widget_proc(hwnd, msg, wparam, lparam):
 _widget_proc_ref = WNDPROC(widget_proc)
 
 def wndproc(hwnd, msg, wparam, lparam):
+    if msg == 0x113 and wparam == 2:  # WM_TIMER 2 - швидка перевірка накладання з сусідами
+        peer_tick(wx)
+        return 0
     if msg == WM_APP_UPDATE or msg == 0x113:  # WM_TIMER
         refresh(hwnd)
         return 0
@@ -1866,6 +1953,7 @@ def main():
     hwnd_main = hwnd
     refresh(hwnd)
     user32.SetTimer(hwnd, 1, 5000, None)
+    user32.SetTimer(hwnd, 2, 1000, None)
     threading.Thread(target=weather_loop, daemon=True).start()
     msg = wt.MSG()
     while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:

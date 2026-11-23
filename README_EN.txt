@@ -1,4 +1,4 @@
-﻿Weather Tray - version 0.4.2
+﻿Weather Tray - version 0.4.4
 ============================
 Українська версія: README.txt
 
@@ -65,3 +65,10 @@ CHANGES
 -------
 0.4.0 - rewritten on the X11 Battery widget engine (taskbar child window, custom drawing, custom
         tooltip, Windows 11 menu, registry settings, lang\xx.json). Versions 0.1-0.3 used Qt.
+0.4.3 - The Weather Tray, Load Tray and X11 Battery widgets no longer overlap: while dragging, a widget
+        stops at its neighbour and cannot jump over it, and a small gap is kept between widgets.
+0.4.4 - The gap between widgets of different programs is 4 dp, like inside X11 Battery (they look like one
+        program). A widget can be placed in front of or behind a neighbour: when you drag past the
+        neighbour's middle it hops to the other side, but never lies on top of it. After switching
+        monitors, starting, or an Explorer restart, the widget that appeared moves away from those
+        already in place; overlap is checked every second.
